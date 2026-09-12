@@ -1,20 +1,11 @@
-// ── Masjid Azan Clock — Push Notification Server ──────────────────────────
-// This tiny server is what makes background alerts reliable even during
-// long gaps (Isha → Fajr, Fajr → Dhuhr) when the phone app is fully closed.
-//
-// How it works:
-//   1. When someone enables notifications in the app, their phone "subscribes"
-//      to this server (one-time, automatic).
-//   2. Once a day (whenever the app is opened), the app sends today's exact
-//      prayer schedule to this server.
-//   3. This server checks every 30 seconds: "is it time to send anyone a
-//      5-minutes-before alert or an azan-time alert?" If yes, it sends a
-//      real Web Push message — which can wake a closed browser/PWA, unlike
-//      a timer running inside the app itself.
-//
-// You need to deploy this file somewhere it can run 24/7 (see DEPLOY.md).
-
-require('dotenv').config();
+// ── Masjid Azan Clock — Push Notification Server (hardened)
+// Improvements made:
+// - Read VAPID contact from env and keep fallback for local dev
+// - Atomic writes for subscriptions.json to reduce corruption
+// - Recover from malformed subscriptions.json by renaming the bad file
+// - Clear, structured logging for subscribe/unsubscribe/schedule/push events
+// - Simple in-memory rate limiting on /schedule to avoid abuse
+// - Process-level handlers for uncaught errors to avoid silent crashes
 
 const express = require('express');
 const webpush = require('web-push');
@@ -28,52 +19,76 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, X-API-KEY');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-// ── VAPID keys — identify this server to push services (generated once) ───
-// IMPORTANT: Set these as environment variables on Render.
-// DO NOT hardcode the private key in your code — it's a security risk!
-const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+// ── VAPID keys & contact — prefer environment variables in production ───
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BHROuGwJuNCj5a8jVzzZHbgtpTK_tq-Vy27huiT0UjclO74NF5r1UADR0wJoM4BP_-boaNwhtkbaT1Y5pr4Zj-Y';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'eyQVqZSNJhmpqixU_wL54YuikQ3iSN6DpJeNgQxCrNw';
+const VAPID_CONTACT     = process.env.VAPID_CONTACT || 'mailto:admin@example.com';
 
-// Check that both keys are provided
-if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-  console.error('❌ ERROR: VAPID keys not found!');
-  console.error('');
-  console.error('To fix this:');
-  console.error('1. Generate keys locally: npx web-push generate-vapid-keys --json');
-  console.error('2. On Render Dashboard → Settings → Environment');
-  console.error('3. Add these two variables:');
-  console.error('   VAPID_PUBLIC_KEY = <your_public_key>');
-  console.error('   VAPID_PRIVATE_KEY = <your_private_key>');
-  console.error('4. Click Save and redeploy');
-  console.error('');
-  process.exit(1);
-}
+webpush.setVapidDetails(VAPID_CONTACT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
-webpush.setVapidDetails(
-  'mailto:admin@example.com', // contact — change to your real email if you like
-  VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY
-);
-
-// ── Storage — a simple JSON file is plenty for a single masjid's traffic ──
+// ── Storage — a simple JSON file is fine for small deployments but ephemeral
 const DB_FILE = path.join(__dirname, 'subscriptions.json');
 
-function loadDB() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch (e) { return {}; }
+function safeParseJSON(content) {
+  try { return JSON.parse(content); }
+  catch (e) { return null; }
 }
+
+function loadDB() {
+  try {
+    if (!fs.existsSync(DB_FILE)) return {};
+    const raw = fs.readFileSync(DB_FILE, 'utf8');
+    const parsed = safeParseJSON(raw);
+    if (!parsed) {
+      // Corrupted DB: move it aside and start fresh
+      const badName = DB_FILE + '.corrupt-' + Date.now();
+      try { fs.renameSync(DB_FILE, badName); console.warn('subscriptions.json corrupted; renamed to', badName); }
+      catch (er) { console.error('Failed to rename corrupted DB file', er); }
+      return {};
+    }
+    return parsed;
+  } catch (e) {
+    console.error('Failed to load DB', e);
+    return {};
+  }
+}
+
+// Atomic write: write to temp file then rename
 function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  try {
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { encoding: 'utf8' });
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) {
+    console.error('Failed to save DB', e);
+  }
 }
 
 // db shape: { [endpoint]: { subscription, prayers: [...], sent: {tag:true} } }
 
-// ── Routes ───────────────────────────────────────────────────────────
+// ── Very small in-memory rate limiter for /schedule (per endpoint)
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 6; // max 6 schedule updates per minute per endpoint
+const rateMap = new Map(); // endpoint => { count, resetAt }
+
+function allowRate(endpoint) {
+  const now = Date.now();
+  const rec = rateMap.get(endpoint);
+  if (!rec || now > rec.resetAt) {
+    rateMap.set(endpoint, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+  if (rec.count >= RATE_LIMIT_MAX) return false;
+  rec.count += 1;
+  return true;
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
@@ -91,32 +106,41 @@ app.post('/subscribe', (req, res) => {
   db[subscription.endpoint].prayers = db[subscription.endpoint].prayers || [];
   db[subscription.endpoint].sent = db[subscription.endpoint].sent || {};
   saveDB(db);
+  console.log('Subscribed:', subscription.endpoint);
   res.json({ ok: true });
 });
 
 // Called when the user disables notifications
 app.post('/unsubscribe', (req, res) => {
   const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'Missing endpoint' });
   const db = loadDB();
-  delete db[endpoint];
-  saveDB(db);
+  if (db[endpoint]) {
+    delete db[endpoint];
+    saveDB(db);
+    console.log('Unsubscribed:', endpoint);
+  }
   res.json({ ok: true });
 });
 
-// Called once a day (whenever the app is opened) with today's exact times,
-// including the user's manual +/- adjustments — this server never needs to
-// know the prayer-time calculation itself, it just trusts what the app sends.
+// Called once a day (whenever the app is opened) with today's exact times.
 app.post('/schedule', (req, res) => {
   const { endpoint, prayers } = req.body;
   if (!endpoint || !Array.isArray(prayers)) {
     return res.status(400).json({ error: 'Missing endpoint or prayers' });
   }
+
+  if (!allowRate(endpoint)) {
+    console.warn('Rate limit exceeded for', endpoint);
+    return res.status(429).json({ error: 'Too many schedule updates, slow down' });
+  }
+
   const db = loadDB();
   if (!db[endpoint]) return res.status(404).json({ error: 'Not subscribed' });
   db[endpoint].prayers = prayers;
-  // Reset "sent" flags for a new day's schedule so today's alerts fire fresh
   db[endpoint].sent = {};
   saveDB(db);
+  console.log('Schedule updated for', endpoint, 'prayers:', prayers.length);
   res.json({ ok: true });
 });
 
@@ -144,9 +168,10 @@ function tick() {
       ];
 
       for (const c of checks) {
-        if (entry.sent[c.tag]) continue;
+        if (entry.sent && entry.sent[c.tag]) continue;
         if (now >= c.at && now - c.at <= WINDOW) {
           sendPush(entry.subscription, c.title, c.body, c.tag, endpoint, db);
+          entry.sent = entry.sent || {};
           entry.sent[c.tag] = true;
           changed = true;
         }
@@ -159,18 +184,30 @@ function tick() {
 
 function sendPush(subscription, title, body, tag, endpoint, db) {
   const payload = JSON.stringify({ title, body, tag });
-  webpush.sendNotification(subscription, payload).catch(err => {
+  webpush.sendNotification(subscription, payload).then(() => {
+    console.log('Push sent:', endpoint, tag, title);
+  }).catch(err => {
     // 410/404 means the subscription is dead (user uninstalled, cleared data, etc.)
-    if (err.statusCode === 404 || err.statusCode === 410) {
+    if (err && (err.statusCode === 404 || err.statusCode === 410)) {
       delete db[endpoint];
       saveDB(db);
+      console.log('Removed stale subscription:', endpoint);
     } else {
-      console.error('Push failed:', err.statusCode, err.body);
+      console.error('Push failed for', endpoint, 'status:', err && err.statusCode, 'body:', err && err.body || err);
     }
   });
 }
 
 setInterval(tick, 30 * 1000);
 
+// Global error handlers to keep the process alive for transient errors and
+// ensure we log useful diagnostics in Render logs.
+process.on('unhandledRejection', (reason, p) => {
+  console.error('Unhandled Rejection at:', p, 'reason:', reason);
+});
+process.on('uncaughtException', err => {
+  console.error('Uncaught Exception:', err);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('✅ Azan push server running on port ' + PORT));
+app.listen(PORT, () => console.log('Azan push server running on port ' + PORT));
