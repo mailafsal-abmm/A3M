@@ -14,6 +14,8 @@
 //
 // You need to deploy this file somewhere it can run 24/7 (see DEPLOY.md).
 
+require('dotenv').config();
+
 const express = require('express');
 const webpush = require('web-push');
 const fs = require('fs');
@@ -39,8 +41,16 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 
 // Check that both keys are provided
 if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-  console.error('ERROR: VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY environment variables are required.');
-  console.error('Set them on Render in Settings → Environment.');
+  console.error('❌ ERROR: VAPID keys not found!');
+  console.error('');
+  console.error('To fix this:');
+  console.error('1. Generate keys locally: npx web-push generate-vapid-keys --json');
+  console.error('2. On Render Dashboard → Settings → Environment');
+  console.error('3. Add these two variables:');
+  console.error('   VAPID_PUBLIC_KEY = <your_public_key>');
+  console.error('   VAPID_PRIVATE_KEY = <your_private_key>');
+  console.error('4. Click Save and redeploy');
+  console.error('');
   process.exit(1);
 }
 
@@ -163,4 +173,4 @@ function sendPush(subscription, title, body, tag, endpoint, db) {
 setInterval(tick, 30 * 1000);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Azan push server running on port ' + PORT));
+app.listen(PORT, () => console.log('✅ Azan push server running on port ' + PORT));
