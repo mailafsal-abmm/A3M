@@ -32,10 +32,17 @@ app.use((req, res, next) => {
 });
 
 // ── VAPID keys — identify this server to push services (generated once) ───
-// For real deployment, set these as environment variables instead of
-// hardcoding, so the private key isn't sitting in your code.
-const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BHROuGwJuNCj5a8jVzzZHbgtpTK_tq-Vy27huiT0UjclO74NF5r1UADR0wJoM4BP_-boaNwhtkbaT1Y5pr4Zj-Y';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'eyQVqZSNJhmpqixU_wL54YuikQ3iSN6DpJeNgQxCrNw';
+// IMPORTANT: Set these as environment variables on Render.
+// DO NOT hardcode the private key in your code — it's a security risk!
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+
+// Check that both keys are provided
+if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+  console.error('ERROR: VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY environment variables are required.');
+  console.error('Set them on Render in Settings → Environment.');
+  process.exit(1);
+}
 
 webpush.setVapidDetails(
   'mailto:admin@example.com', // contact — change to your real email if you like
@@ -56,7 +63,7 @@ function saveDB(db) {
 
 // db shape: { [endpoint]: { subscription, prayers: [...], sent: {tag:true} } }
 
-// ── Routes ──────────────────────────────────────────────────────────────
+// ── Routes ───────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
