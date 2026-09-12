@@ -4,12 +4,15 @@
   "description": "Sends Web Push notifications for prayer times, even when the app is closed",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "dotenv": "^16.3.1"
   },
+  "devDependencies": {},
   "engines": {
     "node": ">=18"
   }
