@@ -1,5 +1,7 @@
 node_modules/
 .env
 .env.local
-*.log
+.env*.local
 subscriptions.json
+*.log
+.DS_Store
